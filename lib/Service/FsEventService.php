@@ -182,6 +182,56 @@ class FsEventService {
 		return false;
 	}
 
+	/**
+	 * Called after the "AI knowledge" tag was removed from a node: removes from the
+	 * index only what is no longer covered by a tag (its own, one on a parent folder,
+	 * or one on a file or sub folder inside it).
+	 */
+	public function onTagRemoved(Node $node): void {
+		if ($this->hasAiKnowledgeTag($node)) {
+			return;
+		}
+
+		if (!($node instanceof Folder)) {
+			$this->onDelete($node);
+			return;
+		}
+
+		$keep = [];
+		try {
+			$tag = $this->tagManager->getTag('AI knowledge', true, true);
+			$taggedIds = $this->tagMapper->getObjectIdsForTags([$tag->getId()], 'files');
+		} catch (TagNotFoundException $e) {
+			$taggedIds = [];
+		}
+		foreach ($taggedIds as $taggedId) {
+			$tagged = $node->getFirstNodeById((int)$taggedId);
+			if ($tagged === null) {
+				continue;
+			}
+			if ($tagged instanceof Folder) {
+				foreach ($this->storageService->getAllFilesInFolder($tagged) as $fileId) {
+					$keep[$fileId] = true;
+				}
+			} else {
+				$keep[$tagged->getId()] = true;
+			}
+		}
+
+		$fileRefs = [];
+		foreach ($this->storageService->getAllFilesInFolder($node) as $fileId) {
+			if (isset($keep[$fileId])) {
+				continue;
+			}
+			try {
+				$fileRefs[] = ProviderConfigService::getSourceId($fileId);
+			} catch (InvalidPathException|NotFoundException|Exception $e) {
+				$this->logger->warning($e->getMessage(), ['exception' => $e]);
+			}
+		}
+		$this->actionService->deleteSources($fileRefs);
+	}
+
 	private function allowedMimeType(Node $file): bool {
 		$mimeType = $file->getMimeType();
 		return in_array($mimeType, Application::MIMETYPES, true);
