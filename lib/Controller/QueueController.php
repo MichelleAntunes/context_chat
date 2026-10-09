@@ -15,6 +15,7 @@ use OCA\ContextChat\Db\QueueContentItem;
 use OCA\ContextChat\Db\QueueContentItemMapper;
 use OCA\ContextChat\Db\QueueFile;
 use OCA\ContextChat\Db\QueueMapper;
+use OCA\ContextChat\Service\FsEventService;
 use OCA\ContextChat\Service\IndexCompletionService;
 use OCA\ContextChat\Service\ProviderConfigService;
 use OCA\ContextChat\Service\QueueService;
@@ -50,6 +51,7 @@ class QueueController extends OCSController {
 		private IJobList $jobList,
 		private ITimeFactory $timeFactory,
 		private QueueMapper $queueMapper,
+		private FsEventService $fsEventService,
 		private IndexCompletionService $indexCompletionService,
 		string $corsMethods = 'PUT, POST, GET, DELETE, PATCH',
 		string $corsAllowedHeaders = 'Authorization, Content-Type, Accept, OCS-APIRequest',
@@ -300,6 +302,9 @@ class QueueController extends OCSController {
 		}
 		if (!($file instanceof File)) {
 			throw new \Exception('File not found or not a file');
+		}
+		if (!$this->fsEventService->hasAiKnowledgeTag($file)) {
+			throw new \Exception('File does not have the required tag for indexing');
 		}
 		$userIds = $storageService->getUsersForFileId($document->getFileId());
 
