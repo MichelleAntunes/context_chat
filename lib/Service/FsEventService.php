@@ -10,16 +10,12 @@ namespace OCA\ContextChat\Service;
 use OCA\ContextChat\AppInfo\Application;
 use OCA\ContextChat\Db\QueueFile;
 use OCA\ContextChat\Logger;
-use OCP\AppFramework\Services\IAppConfig;
 use OCP\DB\Exception;
 use OCP\Files\Folder;
 use OCP\Files\InvalidPathException;
 use OCP\Files\IRootFolder;
 use OCP\Files\Node;
 use OCP\Files\NotFoundException;
-use OCP\SystemTag\ISystemTagManager;
-use OCP\SystemTag\ISystemTagObjectMapper;
-use OCP\SystemTag\TagNotFoundException;
 
 class FsEventService {
 
@@ -29,9 +25,7 @@ class FsEventService {
 		private ActionScheduler $actionService,
 		private StorageService $storageService,
 		private IRootFolder $rootFolder,
-		private ISystemTagManager $tagManager,
-		private IAppConfig $appConfig,
-		private ISystemTagObjectMapper $tagMapper,
+		private TagEligibilityService $tagEligibility,
 	) {
 
 	}
@@ -71,14 +65,24 @@ class FsEventService {
 		}
 	}
 
-	public function onDelete(Node $node, bool $recurse = true): void {
+	/**
+	 * @param bool $onlyEligible only remove files that may be in the index under the current
+	 *   tag rules. Only safe where the tags of the node are still in place (before the node
+	 *   is deleted). Callers that clean up files that are no longer eligible must leave it off.
+	 */
+	public function onDelete(Node $node, bool $recurse = true, bool $onlyEligible = false): void {
 		if ($node instanceof Folder) {
 			if (!$recurse) {
 				return;
 			}
-			$fileIds = $this->storageService->getAllFilesInFolder($node);
+			$fileIds = $onlyEligible
+				? $this->tagEligibility->eligibleFileIds($node)
+				: $this->storageService->getAllFilesInFolder($node);
 		} else {
 			if (!$this->allowedMimeType($node)) {
+				return;
+			}
+			if ($onlyEligible && !$this->tagEligibility->isEligible($node)) {
 				return;
 			}
 			try {
@@ -106,16 +110,17 @@ class FsEventService {
 		if (!$this->allowedPath($node)) {
 			return;
 		}
-		if (!$this->hasAiKnowledgeTag($node)) {
-			return;
-		}
 		if ($node instanceof Folder) {
 			if (!$recurse) {
 				return;
 			}
-			$fileIds = $this->storageService->getAllFilesInFolder($node);
+			// only the files inside that pass the allow/deny tag rules
+			$fileIds = $this->tagEligibility->eligibleFileIds($node);
 		} else {
 			if (!$this->allowedMimeType($node)) {
+				return;
+			}
+			if (!$this->tagEligibility->isEligible($node)) {
 				return;
 			}
 			try {
@@ -142,94 +147,51 @@ class FsEventService {
 		}
 	}
 
+	/**
+	 * Kept under its old name so other callers keep working: is this node
+	 * eligible for indexing under the current mode and allow/deny tag rules?
+	 */
 	public function hasAiKnowledgeTag(Node $node): bool {
-		$mode = $this->appConfig->getAppValueString('index_mode', 'all', lazy: true);
-		if ($mode !== 'tag_only') {
-			// Default mode: index everything, as before.
-			return true;
-		}
-
-		try {
-			$tag = $this->tagManager->getTag('AI knowledge', true, true);
-		} catch (TagNotFoundException $e) {
-			return false;
-		}
-
-		$current = $node;
-		$depth = 0;
-		$maxDepth = 50;
-		while ($current !== null && $depth < $maxDepth) {
-			try {
-				if ($this->tagMapper->haveTag((string)$current->getId(), 'files', $tag->getId())) {
-					return true;
-				}
-			} catch (TagNotFoundException|InvalidPathException|NotFoundException $e) {
-				return false;
-			}
-
-			if ($current->getPath() === '/' || $current->getInternalPath() === '') {
-				break;
-			}
-
-			try {
-				$current = $current->getParent();
-			} catch (\Throwable $e) {
-				break;
-			}
-			$depth++;
-		}
-
-		return false;
+		return $this->tagEligibility->isEligible($node);
 	}
 
 	/**
-	 * Called after the "AI knowledge" tag was removed from a node: removes from the
-	 * index only what is no longer covered by a tag (its own, one on a parent folder,
-	 * or one on a file or sub folder inside it).
+	 * Called after a listed (allow) tag was removed from a node, or a deny tag was
+	 * added: removes from the index what is no longer eligible.
 	 */
 	public function onTagRemoved(Node $node): void {
-		if ($this->hasAiKnowledgeTag($node)) {
-			return;
-		}
-
 		if (!($node instanceof Folder)) {
-			$this->onDelete($node);
+			if (!$this->tagEligibility->isEligible($node)) {
+				$this->deleteFileIds([$node->getId()]);
+			}
 			return;
 		}
 
-		$keep = [];
-		try {
-			$tag = $this->tagManager->getTag('AI knowledge', true, true);
-			$taggedIds = $this->tagMapper->getObjectIdsForTags([$tag->getId()], 'files');
-		} catch (TagNotFoundException $e) {
-			$taggedIds = [];
-		}
-		foreach ($taggedIds as $taggedId) {
-			$tagged = $node->getFirstNodeById((int)$taggedId);
-			if ($tagged === null) {
-				continue;
-			}
-			if ($tagged instanceof Folder) {
-				foreach ($this->storageService->getAllFilesInFolder($tagged) as $fileId) {
-					$keep[$fileId] = true;
-				}
-			} else {
-				$keep[$tagged->getId()] = true;
-			}
-		}
-
-		$fileRefs = [];
+		$keep = array_flip($this->tagEligibility->eligibleFileIds($node));
+		$remove = [];
 		foreach ($this->storageService->getAllFilesInFolder($node) as $fileId) {
-			if (isset($keep[$fileId])) {
-				continue;
+			if (!isset($keep[$fileId])) {
+				$remove[] = $fileId;
 			}
+		}
+		$this->deleteFileIds($remove);
+	}
+
+	/**
+	 * @param int[] $fileIds
+	 */
+	private function deleteFileIds(array $fileIds): void {
+		$fileRefs = [];
+		foreach ($fileIds as $fileId) {
 			try {
 				$fileRefs[] = ProviderConfigService::getSourceId($fileId);
 			} catch (InvalidPathException|NotFoundException|Exception $e) {
 				$this->logger->warning($e->getMessage(), ['exception' => $e]);
 			}
 		}
-		$this->actionService->deleteSources($fileRefs);
+		foreach (array_chunk($fileRefs, ActionScheduler::BATCH_SIZE) as $batch) {
+			$this->actionService->deleteSources($batch);
+		}
 	}
 
 	private function allowedMimeType(Node $file): bool {

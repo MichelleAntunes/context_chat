@@ -11,13 +11,12 @@ namespace OCA\ContextChat\Listener;
 
 use OCA\ContextChat\BackgroundJobs\TagRemovedJob;
 use OCA\ContextChat\Service\FsEventService;
+use OCA\ContextChat\Service\TagEligibilityService;
 use OCP\BackgroundJob\IJobList;
 use OCP\EventDispatcher\Event;
 use OCP\EventDispatcher\IEventListener;
 use OCP\Files\IRootFolder;
-use OCP\SystemTag\ISystemTagManager;
 use OCP\SystemTag\TagAssignedEvent;
-use OCP\SystemTag\TagNotFoundException;
 use OCP\SystemTag\TagUnassignedEvent;
 
 /**
@@ -25,7 +24,7 @@ use OCP\SystemTag\TagUnassignedEvent;
  */
 class TagListener implements IEventListener {
 	public function __construct(
-		private ISystemTagManager $tagManager,
+		private TagEligibilityService $tagEligibility,
 		private IRootFolder $rootFolder,
 		private FsEventService $fsEventService,
 		private IJobList $jobList,
@@ -37,13 +36,19 @@ class TagListener implements IEventListener {
 			return;
 		}
 
-		try {
-			$tag = $this->tagManager->getTag('AI knowledge', true, true);
-		} catch (TagNotFoundException $e) {
+		if ($event->getObjectType() !== 'files') {
 			return;
 		}
 
-		if (!in_array((int)$tag->getId(), $event->getTags(), true)) {
+		// In the "index everything" mode the tags are ignored.
+		if (!$this->tagEligibility->usesTags()) {
+			return;
+		}
+
+		$eventTags = array_map('strval', $event->getTags());
+		$allowHit = array_intersect($this->tagEligibility->getAllowTagIds(), $eventTags) !== [];
+		$denyHit = array_intersect($this->tagEligibility->getDenyTagIds(), $eventTags) !== [];
+		if (!$allowHit && !$denyHit) {
 			return;
 		}
 
@@ -51,7 +56,12 @@ class TagListener implements IEventListener {
 			if ($event instanceof TagUnassignedEvent) {
 				// The tag mapper emits this event while it is still rewriting the tag
 				// rows, so a tag on a parent folder cannot be seen yet. Decide later.
-				$this->jobList->add(TagRemovedJob::class, ['file_id' => (int)$objectId]);
+				if ($allowHit) {
+					$this->jobList->add(TagRemovedJob::class, ['file_id' => (int)$objectId, 'kind' => TagRemovedJob::KIND_ALLOW]);
+				}
+				if ($denyHit) {
+					$this->jobList->add(TagRemovedJob::class, ['file_id' => (int)$objectId, 'kind' => TagRemovedJob::KIND_DENY]);
+				}
 				continue;
 			}
 
@@ -59,7 +69,14 @@ class TagListener implements IEventListener {
 			if ($node === null) {
 				continue;
 			}
-			$this->fsEventService->onInsert($node);
+			if ($allowHit) {
+				// An allow tag was added: index what is now eligible.
+				$this->fsEventService->onInsert($node);
+			}
+			if ($denyHit) {
+				// A deny tag was added: take out of the index what is no longer eligible.
+				$this->fsEventService->onTagRemoved($node);
+			}
 		}
 	}
 }
