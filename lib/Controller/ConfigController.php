@@ -10,6 +10,7 @@ namespace OCA\ContextChat\Controller;
 use OCA\ContextChat\BackgroundJobs\SchedulerJob;
 use OCA\ContextChat\BackgroundJobs\UntaggedCleanupSchedulerJob;
 use OCP\AppFramework\Controller;
+use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\Attribute\NoAdminRequired;
 use OCP\AppFramework\Http\DataResponse;
 use OCP\AppFramework\Services\IAppConfig;
@@ -19,6 +20,8 @@ use OCP\IRequest;
 use OCP\PreConditionNotMetException;
 
 class ConfigController extends Controller {
+
+	private const TAG_LIST_KEYS = ['tag_allow_ids', 'tag_deny_ids'];
 
 	public function __construct(
 		string $appName,
@@ -64,6 +67,66 @@ class ConfigController extends Controller {
 			$this->jobList->add(SchedulerJob::class);
 		}
 	}
+
+	/**
+	 * Turns the allow/deny tag lists of a request into a JSON list of unique, sorted
+	 * tag ids, which is how they are stored. Accepts an array or a JSON string.
+	 *
+	 * @throws \InvalidArgumentException if a list is not a list of tag ids
+	 */
+	private function normalizeTagLists(array $values): array {
+		foreach (self::TAG_LIST_KEYS as $key) {
+			if (!array_key_exists($key, $values)) {
+				continue;
+			}
+			$raw = $values[$key];
+			if (is_string($raw)) {
+				$raw = $raw === '' ? [] : json_decode($raw, true);
+			}
+			if (!is_array($raw)) {
+				throw new \InvalidArgumentException("The value of $key must be a list of tag ids.");
+			}
+			$ids = [];
+			foreach ($raw as $id) {
+				if (!is_int($id) && !(is_string($id) && ctype_digit($id))) {
+					throw new \InvalidArgumentException("The value of $key must be a list of tag ids.");
+				}
+				$ids[(int)$id] = (int)$id;
+			}
+			sort($ids);
+			$values[$key] = json_encode(array_values($ids));
+		}
+		return $values;
+	}
+
+	/**
+	 * Checks the settings as they will be after saving: what is already stored plus
+	 * what arrived in the request.
+	 *
+	 * @throws \InvalidArgumentException
+	 */
+	private function validateTagConfig(array $values): void {
+		$allow = $this->tagIds($values, 'tag_allow_ids');
+		$deny = $this->tagIds($values, 'tag_deny_ids');
+		$mode = $values['index_mode'] ?? $this->appConfig->getAppValueString('index_mode', 'all', lazy: true);
+
+		if (array_intersect($allow, $deny) !== []) {
+			throw new \InvalidArgumentException('The same tag cannot be in both the allow list and the deny list.');
+		}
+		if ($mode === 'tag_only' && $allow === [] && $deny === []) {
+			throw new \InvalidArgumentException('Select at least one allow or deny tag before indexing by tags.');
+		}
+	}
+
+	/**
+	 * @return int[]
+	 */
+	private function tagIds(array $values, string $key): array {
+		$raw = $values[$key] ?? $this->appConfig->getAppValueString($key, '[]', lazy: true);
+		$decoded = json_decode((string)$raw, true);
+		return is_array($decoded) ? array_map('intval', $decoded) : [];
+	}
+
 	/**
 	 * Set admin config values
 	 *
@@ -71,6 +134,12 @@ class ConfigController extends Controller {
 	 * @return DataResponse
 	 */
 	public function setAdminConfig(array $values): DataResponse {
+		try {
+			$values = $this->normalizeTagLists($values);
+			$this->validateTagConfig($values);
+		} catch (\InvalidArgumentException $e) {
+			return new DataResponse(['message' => $e->getMessage()], Http::STATUS_BAD_REQUEST);
+		}
 		$this->handleIndexModeChange($values);
 		foreach ($values as $key => $value) {
 			$this->appConfig->setAppValueString($key, $value, lazy: true);
