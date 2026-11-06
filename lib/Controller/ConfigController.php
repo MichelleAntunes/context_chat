@@ -8,6 +8,7 @@
 namespace OCA\ContextChat\Controller;
 
 use OCA\ContextChat\BackgroundJobs\SchedulerJob;
+use OCA\ContextChat\BackgroundJobs\TagListChangedJob;
 use OCA\ContextChat\BackgroundJobs\UntaggedCleanupSchedulerJob;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
@@ -66,6 +67,71 @@ class ConfigController extends Controller {
 		} else {
 			$this->jobList->add(SchedulerJob::class);
 		}
+	}
+
+	/**
+	 * Keeps the index in line with a change of the allow/deny lists, without reading every
+	 * file when that is not needed:
+	 *  - the allow list goes from empty to filled: only files without an allow tag can
+	 *    change (they must leave), so a full cleanup runs;
+	 *  - the allow list goes from filled to empty: only files without tags can change
+	 *    (they must enter), so a full indexing run is started;
+	 *  - any other change: only files carrying the tag that was added or removed can change,
+	 *    so one small job per tag looks at those files.
+	 * Does nothing in mode "all", and when the mode itself changes in the same request
+	 * (handleIndexModeChange already starts a full run then).
+	 * Expects $values after normalizeTagLists and before the new values are stored.
+	 */
+	private function handleTagListChange(array $values): void {
+		$oldMode = $this->appConfig->getAppValueString('index_mode', 'all', lazy: true);
+		$newMode = $values['index_mode'] ?? $oldMode;
+		if ($oldMode !== 'tag_only' || $newMode !== 'tag_only') {
+			return;
+		}
+
+		$oldAllow = $this->sortedTagIds([], 'tag_allow_ids');
+		$newAllow = $this->sortedTagIds($values, 'tag_allow_ids');
+		$oldDeny = $this->sortedTagIds([], 'tag_deny_ids');
+		$newDeny = $this->sortedTagIds($values, 'tag_deny_ids');
+
+		$allowStarted = $oldAllow === [] && $newAllow !== [];
+		$allowEmptied = $oldAllow !== [] && $newAllow === [];
+		if ($allowStarted) {
+			$this->jobList->add(UntaggedCleanupSchedulerJob::class);
+		}
+		if ($allowEmptied) {
+			$this->jobList->add(SchedulerJob::class);
+		}
+
+		if (!$allowStarted) {
+			foreach (array_diff($newAllow, $oldAllow) as $tagId) {
+				$this->addTagListChangedJob($tagId, TagListChangedJob::ACTION_INDEX);
+			}
+		}
+		if (!$allowEmptied) {
+			foreach (array_diff($oldAllow, $newAllow) as $tagId) {
+				$this->addTagListChangedJob($tagId, TagListChangedJob::ACTION_REMOVE);
+			}
+		}
+		foreach (array_diff($newDeny, $oldDeny) as $tagId) {
+			$this->addTagListChangedJob($tagId, TagListChangedJob::ACTION_REMOVE);
+		}
+		foreach (array_diff($oldDeny, $newDeny) as $tagId) {
+			$this->addTagListChangedJob($tagId, TagListChangedJob::ACTION_INDEX);
+		}
+	}
+
+	private function addTagListChangedJob(int $tagId, string $action): void {
+		$this->jobList->add(TagListChangedJob::class, ['tag_id' => $tagId, 'action' => $action]);
+	}
+
+	/**
+	 * @return int[] unique, sorted
+	 */
+	private function sortedTagIds(array $values, string $key): array {
+		$ids = array_unique($this->tagIds($values, $key));
+		sort($ids);
+		return array_values($ids);
 	}
 
 	/**
@@ -141,6 +207,7 @@ class ConfigController extends Controller {
 			return new DataResponse(['message' => $e->getMessage()], Http::STATUS_BAD_REQUEST);
 		}
 		$this->handleIndexModeChange($values);
+		$this->handleTagListChange($values);
 		foreach ($values as $key => $value) {
 			$this->appConfig->setAppValueString($key, $value, lazy: true);
 		}
