@@ -82,11 +82,41 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 			name="index_mode_radio"
 			type="radio"
 			@update:model-value="onIndexModeChange('tag_only')">
-			{{ t('context_chat', "Index only documents tagged 'AI knowledge'") }}
+			{{ t('context_chat', 'Index considering tags (allow and deny lists)') }}
 		</NcCheckboxRadioSwitch>
 		<NcNoteCard type="warning">
-			{{ t('context_chat', "When 'Index only documents tagged AI knowledge' is selected, only documents with that tag are indexed, and any previously indexed documents without it are removed from the index. Add the tag to any document you want indexed.") }}
+			{{ t('context_chat', "When 'Index considering tags' is selected, only documents that pass the tag rules below are indexed, and any previously indexed documents that do not are removed from the index. A tag on a folder applies to everything inside it, and a deny tag always wins over an allow tag.") }}
 		</NcNoteCard>
+
+		<h3>{{ t('context_chat', 'Tags') }}</h3>
+		<NcNoteCard v-if="indexMode === 'all'" type="info">
+			{{ t('context_chat', "The selected tags are ignored while 'Index all documents' is selected.") }}
+		</NcNoteCard>
+		<NcNoteCard v-else type="info">
+			<p><strong>{{ t('context_chat', 'How the tags are applied:') }}</strong></p>
+			<ul class="tag-rules">
+				<li>{{ t('context_chat', 'Only allow tags selected: only documents that have at least one of them are indexed.') }}</li>
+				<li>{{ t('context_chat', 'Only deny tags selected: all documents are indexed, except those that have at least one of them.') }}</li>
+				<li>{{ t('context_chat', 'Both selected: documents that have an allow tag are indexed, except those that also have a deny tag.') }}</li>
+			</ul>
+		</NcNoteCard>
+		<NcSelect
+			:model-value="selectedAllowTags"
+			:options="allowOptions"
+			:input-label="t('context_chat', 'Allow tags')"
+			:disabled="savingTags"
+			multiple
+			label="label"
+			@update:model-value="onTagsChange('tag_allow_ids', $event)" />
+		<p>&nbsp;</p>
+		<NcSelect
+			:model-value="selectedDenyTags"
+			:options="denyOptions"
+			:input-label="t('context_chat', 'Deny tags')"
+			:disabled="savingTags"
+			multiple
+			label="label"
+			@update:model-value="onTagsChange('tag_deny_ids', $event)" />
 
 		<h3>{{ t('context_chat', 'Download Logs') }}</h3>
 		<div class="horizontal-flex">
@@ -112,22 +142,42 @@ import { showError, showSuccess } from '@nextcloud/dialogs'
 import '@nextcloud/dialogs/style.css'
 import { loadState } from '@nextcloud/initial-state'
 import { generateUrl } from '@nextcloud/router'
-import { NcButton, NcCheckboxRadioSwitch, NcNoteCard, NcSettingsSection } from '@nextcloud/vue'
+import { NcButton, NcCheckboxRadioSwitch, NcNoteCard, NcSelect, NcSettingsSection } from '@nextcloud/vue'
 import humanizeDuration from 'humanize-duration'
 
 const MAX_RELATIVE_DATE = 1000 * 60 * 60 * 24 * 7 // one week
 
 export default {
 	name: 'ViewAdmin',
-	components: { NcSettingsSection, NcNoteCard, NcButton, NcCheckboxRadioSwitch },
+	components: { NcSettingsSection, NcNoteCard, NcButton, NcCheckboxRadioSwitch, NcSelect },
 
 	data() {
 		return {
 			stats: {},
 			indexMode: 'all',
+			allowIds: [],
+			denyIds: [],
+			systemTags: [],
+			savingTags: false,
 			downloadURLNextcloudLogs: generateUrl('/apps/context_chat/download-logs-nextcloud'),
 			downloadURLDockerLogs: generateUrl('/apps/app_api/proxy/context_chat_backend/downloadLogs'),
 		}
+	},
+
+	computed: {
+		// A tag chosen in one list is not offered in the other one.
+		allowOptions() {
+			return this.systemTags.filter((tag) => !this.denyIds.includes(tag.id))
+		},
+		denyOptions() {
+			return this.systemTags.filter((tag) => !this.allowIds.includes(tag.id))
+		},
+		selectedAllowTags() {
+			return this.systemTags.filter((tag) => this.allowIds.includes(tag.id))
+		},
+		selectedDenyTags() {
+			return this.systemTags.filter((tag) => this.denyIds.includes(tag.id))
+		},
 	},
 
 	watch: {
@@ -139,6 +189,9 @@ export default {
 	async created() {
 		this.stats = loadState('context_chat', 'stats')
 		this.indexMode = loadState('context_chat', 'index_mode')
+		this.allowIds = loadState('context_chat', 'tag_allow_ids')
+		this.denyIds = loadState('context_chat', 'tag_deny_ids')
+		this.systemTags = loadState('context_chat', 'system_tags')
 	},
 
 	methods: {
@@ -173,8 +226,29 @@ export default {
 				showSuccess(this.t('context_chat', 'Context Chat admin options saved'))
 			} catch (error) {
 				this.indexMode = previousValue
-				showError(this.t('context_chat', 'Failed to save indexing mode'))
+				showError(this.errorMessage(error, this.t('context_chat', 'Failed to save indexing mode')))
 			}
+		},
+		async onTagsChange(key, selectedTags) {
+			const field = key === 'tag_allow_ids' ? 'allowIds' : 'denyIds'
+			const previousValue = this[field]
+			this[field] = selectedTags.map((tag) => tag.id)
+			this.savingTags = true
+			try {
+				await axios.put(generateUrl('/apps/context_chat/admin-config'), {
+					values: { [key]: this[field] },
+				})
+				showSuccess(this.t('context_chat', 'Context Chat admin options saved'))
+			} catch (error) {
+				this[field] = previousValue
+				showError(this.errorMessage(error, this.t('context_chat', 'Failed to save the tags')))
+			} finally {
+				this.savingTags = false
+			}
+		},
+		// The server explains why it refused a setting; show that instead of a generic text.
+		errorMessage(error, fallback) {
+			return error?.response?.data?.message || fallback
 		},
 	},
 }
@@ -212,5 +286,11 @@ figure[class^='icon-'] {
 .horizontal-flex {
 	display: flex;
 	gap: 10px;
+}
+
+.tag-rules {
+	list-style: disc;
+	margin: 4px 0 0;
+	padding-inline-start: 20px;
 }
 </style>
