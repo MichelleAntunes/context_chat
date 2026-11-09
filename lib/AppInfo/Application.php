@@ -13,6 +13,7 @@ use OCA\ContextChat\Listener\FileListener;
 use OCA\ContextChat\Listener\ShareListener;
 use OCA\ContextChat\Listener\TagListener;
 use OCA\ContextChat\Listener\UserDeletedListener;
+use OCA\ContextChat\Notification\Notifier;
 use OCP\App\Events\AppDisableEvent;
 use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
@@ -77,6 +78,7 @@ class Application extends App implements IBootstrap {
 		$context->registerEventListener(TagUnassignedEvent::class, TagListener::class);
 		$context->registerEventListener(AppDisableEvent::class, AppDisableListener::class);
 		$context->registerEventListener(UserDeletedEvent::class, UserDeletedListener::class);
+		$context->registerNotifierService(Notifier::class);
 		// These events were added mid-way through NC 30, 31
 		if (class_exists('OCP\Files\Config\Event\UserMountAddedEvent')) {
 			$context->registerEventListener('OCP\Files\Config\Event\UserMountAddedEvent', FileListener::class);

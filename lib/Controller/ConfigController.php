@@ -9,6 +9,7 @@ namespace OCA\ContextChat\Controller;
 
 use OCA\ContextChat\BackgroundJobs\SchedulerJob;
 use OCA\ContextChat\BackgroundJobs\TagListChangedJob;
+use OCA\ContextChat\BackgroundJobs\TagModeNoticeJob;
 use OCA\ContextChat\BackgroundJobs\UntaggedCleanupSchedulerJob;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
@@ -64,8 +65,13 @@ class ConfigController extends Controller {
 		}
 		if ($newMode === 'tag_only') {
 			$this->jobList->add(UntaggedCleanupSchedulerJob::class);
+			$this->jobList->add(TagModeNoticeJob::class, [
+				'action' => TagModeNoticeJob::ACTION_NOTIFY,
+				'skip_user' => $this->userId,
+			]);
 		} else {
 			$this->jobList->add(SchedulerJob::class);
+			$this->jobList->add(TagModeNoticeJob::class, ['action' => TagModeNoticeJob::ACTION_DISMISS]);
 		}
 	}
 
